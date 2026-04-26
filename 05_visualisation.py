@@ -728,11 +728,11 @@ def fig9_maup_sensitivity():
         if LL_vals[i] is None: LL_vals[i] = defaults["LL"][i]
         if NS_vals[i] is None: NS_vals[i] = defaults["NS"][i]
 
-    fig = plt.figure(figsize=(14, 6), facecolor="white")
+    fig = plt.figure(figsize=(14, 7), facecolor="white")
     fig.suptitle(
         "SDG 11 Bangkok — MAUP Sensitivity Analysis  (Proposal §4)\n"
         "Spatial conclusions across three grid resolutions: 250 m | 500 m | 1 km",
-        fontsize=11, fontweight="bold", y=0.98)
+        fontsize=11, fontweight="bold", y=0.97)
 
     gs = GridSpec(1, 3, figure=fig, wspace=0.42)
     x = np.arange(3)
@@ -836,7 +836,7 @@ def fig9_maup_sensitivity():
         spine.set_visible(True); spine.set_edgecolor("#2980b9"); spine.set_linewidth(1.5)
     ax_c.set_facecolor("#f0f8ff")
 
-    plt.tight_layout(rect=[0, 0, 1, 0.92])
+    fig.subplots_adjust(top=0.84, bottom=0.12, left=0.07, right=0.97, wspace=0.42)
     out = os.path.join(FIG_DIR, "Fig9_MAUP_Sensitivity.png")
     fig.savefig(out, dpi=150, bbox_inches="tight")
     plt.close(fig)
