@@ -122,14 +122,131 @@ def extract_pca_section(txt):
 
 
 def extract_spatial_section(txt):
-    """Pull key numbers from spatial_analysis_report.txt."""
+    """
+    Return the full content of spatial_analysis_report.txt verbatim.
+
+    Previous version filtered only lines starting with '---', 'USI', or
+    two spaces. That was buggy: ln.strip().startswith('  ') is *always*
+    False because strip() removes the leading spaces first, so every
+    indented data line (LISA counts, Gi* counts, per-indicator I values)
+    was silently dropped, leaving only the bare '--- ... ---' headers.
+
+    Simplest correct approach: include all non-empty lines as-is.
+    """
     lines = txt.split("\n")
+    # Indent every line by two spaces so it sits clearly under the section
+    # header in report.txt, but preserve blank separator lines.
     out = []
     for ln in lines:
-        if ln.strip().startswith("---") or ln.strip().startswith("USI") \
-                or ln.strip().startswith("  "):
-            out.append(ln)
+        if ln.strip() == "":
+            out.append("")
+        else:
+            out.append("  " + ln if not ln.startswith("  ") else ln)
     return "\n".join(out)
+
+
+def parse_maup_report(path):
+    """
+    Parse maup_sensitivity_report.txt and return a dict with structured values:
+      {
+        "250m": {"I": float, "z": float, "p": float,
+                 "HH": float, "LL": float, "HL": float, "LH": float, "NS": float},
+        "500m": { … },
+        "1km":  { … },
+        "mono_ok": bool | None,
+        "rel_range": float | None,
+      }
+    Returns None if the file cannot be parsed.
+    """
+    import re
+    if not os.path.exists(path):
+        return None
+    try:
+        txt = open(path, encoding="utf-8").read()
+    except Exception:
+        return None
+
+    result = {}
+
+    # ── Parse Global Moran's I table ─────────────────────────────────────────
+    # Expected line format (fixed-width):
+    #   250m  <grid>  <valid>  <I>  <z>  <p>  clustered/random
+    moran_pat = re.compile(
+        r"^\s*(250m|500m|1km)\s+\S+\s+[\d,]+\s+"
+        r"(-?\d+\.\d+)\s+(-?\d+\.\d+)\s+([\d.]+)",
+        re.MULTILINE,
+    )
+    for m in moran_pat.finditer(txt):
+        scale = m.group(1)
+        result.setdefault(scale, {})
+        result[scale]["I"] = float(m.group(2))
+        result[scale]["z"] = float(m.group(3))
+        result[scale]["p"] = float(m.group(4))
+
+    # ── Parse LISA table ───────────────────────────────────────────────────────
+    # Expected line format:
+    #   250m  <HH %>  <LL %>  <HL %>  <LH %>  <NS %>
+    lisa_pat = re.compile(
+        r"^\s*(250m|500m|1km)\s+"
+        r"(-?\d+\.\d+)\s+(-?\d+\.\d+)\s+(-?\d+\.\d+)\s+(-?\d+\.\d+)\s+(-?\d+\.\d+)",
+        re.MULTILINE,
+    )
+    for m in lisa_pat.finditer(txt):
+        scale = m.group(1)
+        result.setdefault(scale, {})
+        result[scale]["HH"] = float(m.group(2))
+        result[scale]["LL"] = float(m.group(3))
+        result[scale]["HL"] = float(m.group(4))
+        result[scale]["LH"] = float(m.group(5))
+        result[scale]["NS"] = float(m.group(6))
+
+    # ── Parse monotonicity verdict ─────────────────────────────────────────────
+    result["mono_ok"]   = ("CORRECT monotonicity" in txt)
+    rr_m = re.search(r"Relative range across scales:\s*([\d.]+)%", txt)
+    result["rel_range"] = float(rr_m.group(1)) if rr_m else None
+
+    return result if result else None
+
+
+def parse_pca_values(pca_txt):
+    """
+    Extract key numeric values from pca_report.txt so report.txt never
+    contains hardcoded figures that go stale when the pipeline is re-run.
+
+    Returns dict with keys (all float, or None if not found):
+      pc1_var, pc2_var, cum2
+      load_NTL, load_NDVI, load_LST, load_PM25, load_PopDensity, load_Accessibility
+    """
+    import re
+    result = {}
+    m = re.search(r"PC1:\s*([\d.]+)%", pca_txt)
+    if m: result["pc1_var"] = float(m.group(1))
+    m = re.search(r"PC2:\s*([\d.]+)%", pca_txt)
+    if m: result["pc2_var"] = float(m.group(1))
+    m = re.search(r"PC2.*?cumulative.*?([\d.]+)%\)", pca_txt)
+    if m: result["cum2"] = float(m.group(1))
+    for name in ("NTL", "NDVI", "LST", "PM25", "PopDensity", "Accessibility"):
+        m = re.search(rf"^\s*{name}\s+([+-]?\d+\.\d+)", pca_txt, re.MULTILINE)
+        if m: result[f"load_{name}"] = float(m.group(1))
+    return result
+
+
+def parse_ndvi_clipping(pca_txt):
+    """
+    Extract NDVI clipping sensitivity stats from pca_report.txt.
+    Returns a dict with keys: r, diff_pct, verdict, or None if not found.
+    """
+    import re
+    if "NDVI CLIPPING SENSITIVITY" not in pca_txt:
+        return None
+    r_m    = re.search(r"Pearson r \(orig vs clipped USI_PCA\)\s*:\s*([\d.]+)", pca_txt)
+    diff_m = re.search(r"Mean \|Δ USI\|\s*:\s*([\d.]+)", pca_txt)
+    verd_m = re.search(r"Verdict\s*:\s*(.+)", pca_txt)
+    return {
+        "r":       float(r_m.group(1))    if r_m    else None,
+        "diff":    float(diff_m.group(1)) if diff_m else None,
+        "verdict": verd_m.group(1).strip() if verd_m else "see pca_report.txt",
+    }
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
@@ -224,15 +341,16 @@ def main():
         print(f"  Gi* load error: {e}")
 
     # ── MAUP section ──────────────────────────────────────────────────────────
-    maup_section = ""
-    if os.path.exists(MAUP_REPORT):
-        maup_section = read_file(MAUP_REPORT)
-    else:
-        maup_section = (
-            "MAUP sensitivity runs at 250 m and 1 km were not yet executed.\n"
-            "Run 07_maup_sensitivity.py to produce these results.\n"
-            "Expected outputs: MAUP_250m_report.txt and MAUP_1km_report.txt."
-        )
+    # parse_maup_report returns a dict with scale keys if the file exists and
+    # is parseable, or None otherwise.  We defer the fallback decision to the
+    # report-assembly block so there is no sentinel variable to misread.
+    maup_parsed = parse_maup_report(MAUP_REPORT)
+    print(f"  MAUP report parsed: {'OK (' + str(len(maup_parsed)) + ' keys)' if maup_parsed else 'NOT FOUND / unparseable'}")
+
+    # ── NDVI clipping ─────────────────────────────────────────────────────────
+    pca_txt      = read_file(PCA_RPT)
+    ndvi_clip    = parse_ndvi_clipping(pca_txt)
+    pca_vals     = parse_pca_values(pca_txt)
 
     # ── Assemble report ────────────────────────────────────────────────────────
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -293,6 +411,10 @@ def main():
         A(f"    CV           : {s['cv']:.1f}%")
 
     # ── 2a. Preprocessing notes ────────────────────────────────────────────────
+    # Dynamic values from pca_report.txt (avoid hardcoding figures that change)
+    _pm25_load = pca_vals.get("load_PM25")
+    pm25_load_str = f"{_pm25_load:+.4f}" if _pm25_load is not None else "(see pca_report.txt)"
+
     A("\n\n  PREPROCESSING NOTES")
     A("  " + "-"*40)
     A("""
@@ -302,17 +424,17 @@ def main():
     impervious surfaces. These cells are valid observations; they are not clipped
     before normalisation. The raw NDVI range [−0.624, +0.760] is preserved, and
     min-max normalisation maps them to [0, 1]. In the composite USI they represent
-    the lowest vegetation-cover cells, which is ecologically correct.
-
+    the lowest vegetation-cover cells, which is ecologically correct.""")
+    A(f"""
   PM₂.₅ spatial variance (CV = 2.6%, range = 7 µg/m³):
-    The ACAG satellite-derived PM₂.₅ product has a native resolution of ~1 km.
-    After upsampling to 500 m (bilinear interpolation), the spatial variance
-    within Bangkok's boundary is very low (CV ≈ 2.6%). Consequently, the PM₂.₅
-    PC1 loading = +0.013 (near zero), contributing minimal information to the PCA
+    The PCD station-interpolated PM₂.₅ product has limited spatial resolution
+    within Bangkok. After resampling to 500 m the intra-city variance is low
+    (CV ≈ 2.6%). The PM₂.₅ PC1 loading = {pm25_load_str} (small relative to
+    Accessibility +0.54 and NTL +0.53), contributing modest weight to the PCA
     composite. This is a data limitation, not a processing error.
-    LIMITATION: For sub-city PM₂.₅ spatial patterns, station-interpolated data
-    (e.g., pm2.5_2023.csv) would be more appropriate. Document in Methods section.
-
+    LIMITATION: For finer sub-city PM₂.₅ gradients, higher-resolution station
+    data or a dispersion model would be more appropriate. Document in Methods.""")
+    A("""
   Healthcare OSM data sparsity (n = 143 facilities):
     Only 143 healthcare facilities were identified from OSM within the Bangkok
     boundary, compared with 3,167 transport stops and 1,136 schools. OSM
@@ -351,24 +473,33 @@ def main():
     # ── 4. PCA ─────────────────────────────────────────────────────────────────
     A("\n\n4. PRINCIPAL COMPONENT ANALYSIS (PCA)")
     A(sub)
-    pca_txt = read_file(PCA_RPT)
     A(extract_pca_section(pca_txt))
-    A("""
+    # Build PC1 interpretation dynamically so values stay in sync with pca_report.txt
+    _pc1v  = pca_vals.get("pc1_var", float("nan"))
+    _ndvi  = pca_vals.get("load_NDVI",  float("nan"))
+    _lst   = pca_vals.get("load_LST",   float("nan"))
+    _pm25  = pca_vals.get("load_PM25",  float("nan"))
+    _pc1v_str = f"{_pc1v:.1f}%" if not np.isnan(_pc1v) else "(see pca_report)"
+    _pm25_str = f"{_pm25:+.4f}" if not np.isnan(_pm25) else "(see pca_report)"
+    _ndvi_str = f"{_ndvi:+.3f}" if not np.isnan(_ndvi) else "(see pca_report)"
+    _lst_str  = f"{_lst:+.3f}"  if not np.isnan(_lst)  else "(see pca_report)"
+    A(f"""
   INTERPRETATION OF PC1 STRUCTURE:
-  PC1 explains 48.0% of total variance and captures Bangkok's dominant
+  PC1 explains {_pc1v_str} of total variance and captures Bangkok's dominant
   spatial gradient: urban accessibility / NTL intensity (high positive loadings)
   versus green vegetation cover and cool temperatures (negative loadings).
 
-  The negative loadings of NDVI (−0.253) and inverted-LST (−0.546) on PC1
+  The negative loadings of NDVI ({_ndvi_str}) and inverted-LST ({_lst_str}) on PC1
   are NOT a sign error. They reflect a genuine urban trade-off:
     • Central Bangkok is highly accessible and well-lit (HH in USI_PCA)
     • But it is also hotter and less green than the urban periphery
   PC1 therefore measures urban intensity, not a balanced sustainability optimum.
 
-  PM₂.₅ loading (+0.013) is near zero, consistent with its low spatial
-  variance (CV = 2.6%). This is an inherent limitation of the PCD data at
-  this scale (see §2 preprocessing notes).
-""".format(r_val=r_val))
+  PM₂.₅ loading ({_pm25_str}) is relatively small compared to the dominant
+  indicators (Accessibility +0.54, NTL +0.53). Its low PC1 weight reflects
+  the limited intra-city spatial variance of the PCD interpolated product
+  (CV = 2.6%). See §2 preprocessing notes for details.
+""")
 
     # ── Policy discussion on USI_PCA vs USI_EW divergence ─────────────────────
     if not np.isnan(r_val):
@@ -498,7 +629,93 @@ def main():
     # ── 7. MAUP sensitivity ────────────────────────────────────────────────────
     A("\n7. MAUP SENSITIVITY ANALYSIS")
     A(sub)
-    A(maup_section)
+    if maup_parsed is None:
+        # maup_sensitivity_report.txt not found or could not be parsed
+        A("  MAUP sensitivity runs at 250 m and 1 km were not yet executed.")
+        A("  Run 07_maup_sensitivity.py first, then re-run this script.")
+    else:
+        # Build a structured comparison table from the parsed values
+        mp = maup_parsed
+        scales = [s for s in ["250m", "500m", "1km"] if s in mp]
+
+        A("  Source: maup_sensitivity_report.txt  (07_maup_sensitivity.py)")
+        A("")
+
+        # Moran's I table
+        A(f"  {'Scale':>6s}  {'Moran I':>9s}  {'z':>8s}  {'p':>8s}  Significance")
+        A(f"  {'-'*6}  {'-'*9}  {'-'*8}  {'-'*8}  {'-'*20}")
+        for sc in scales:
+            d   = mp[sc]
+            sig = "clustered *" if d.get("p", 1) <= 0.05 else "not sig."
+            can = "  ◄ canonical" if sc == "500m" else ""
+            A(f"  {sc:>6s}  {d.get('I', float('nan')):>9.4f}  "
+              f"{d.get('z', float('nan')):>8.3f}  "
+              f"{d.get('p', float('nan')):>8.4f}  {sig}{can}")
+
+        A("")
+
+        # LISA table (only if parsed)
+        if all(k in mp.get(scales[0], {}) for k in ("HH", "LL", "HL", "LH", "NS")):
+            A(f"  LISA cluster proportions (% of valid cells):")
+            A(f"  {'Scale':>6s}  {'HH %':>7s}  {'LL %':>7s}  {'HL %':>7s}  {'LH %':>7s}  {'NS %':>7s}")
+            A(f"  {'-'*6}  {'-'*7}  {'-'*7}  {'-'*7}  {'-'*7}  {'-'*7}")
+            for sc in scales:
+                d   = mp[sc]
+                can = "  ◄ canonical" if sc == "500m" else ""
+                A(f"  {sc:>6s}  "
+                  f"{d.get('HH', float('nan')):>7.1f}  "
+                  f"{d.get('LL', float('nan')):>7.1f}  "
+                  f"{d.get('HL', float('nan')):>7.1f}  "
+                  f"{d.get('LH', float('nan')):>7.1f}  "
+                  f"{d.get('NS', float('nan')):>7.1f}{can}")
+            A("")
+
+        # Monotonicity verdict
+        if mp.get("mono_ok") is not None:
+            verb = "CORRECT monotonicity ✓" if mp["mono_ok"] else "Non-monotonic — inspect carefully"
+            A(f"  Moran's I pattern: {verb}")
+        if mp.get("rel_range") is not None:
+            rr = mp["rel_range"]
+            if rr < 15:
+                stab = "STABLE (<15% variation)"
+            elif rr < 30:
+                stab = "MODERATE scale sensitivity (15–30%)"
+            else:
+                stab = "HIGH scale sensitivity (>30%)"
+            A(f"  Relative range across scales: {rr:.1f}%  → {stab}")
+        A("")
+        A("  Full details (methodology, raw tables, interpretation):")
+        A(f"  → {MAUP_REPORT}")
+
+    # ── 7b. NDVI Clipping Sensitivity ─────────────────────────────────────────
+    A("\n\n7b. NDVI CLIPPING SENSITIVITY")
+    A(sub)
+    if ndvi_clip is None:
+        A("  NDVI clipping test not yet run or pca_report.txt does not contain results.")
+        A("  Re-run 03_normalise_and_pca_usi.py after generating")
+        A("  02b_NDVI_S2_clipped_500m.tif (produced by 01_resample_indicators.py).")
+    else:
+        r_clip  = ndvi_clip["r"]
+        diff_pp = ndvi_clip["diff"]
+        verdict = ndvi_clip["verdict"]
+        A("  Test: replace raw NDVI (min ≈ −0.624) with clipped version (negative → 0.0),")
+        A("  re-run PCA, and compare USI_PCA spatial patterns.")
+        A("")
+        A(f"  Pearson r (USI_PCA_orig vs USI_PCA_clipped)  : "
+          f"{r_clip:.4f}" if r_clip is not None else "  Pearson r : (not parsed)")
+        if diff_pp is not None:
+            A(f"  Mean absolute USI difference                 : {diff_pp:.2f} pp")
+        A(f"  Verdict : {verdict}")
+        A("")
+        if r_clip is not None:
+            if r_clip >= 0.95:
+                A("  CONCLUSION: The original (unclipped) USI_PCA is ROBUST to NDVI clipping.")
+                A("  Negative NDVI cells (water/impervious surfaces) do not distort the composite.")
+                A("  The unclipped run remains authoritative for all downstream analyses.")
+            else:
+                A("  CONCLUSION: USI_PCA is SENSITIVE to NDVI clipping. Both scenarios")
+                A("  should be reported. Clipped scenario removes water-body bias from")
+                A("  the urban NDVI gradient (see 10b_USI_PCA_NDVIclipped_500m.tif).")
 
     # ── 8. Limitations ────────────────────────────────────────────────────────
     A("\n\n8. KEY LIMITATIONS")
