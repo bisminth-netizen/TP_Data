@@ -43,7 +43,7 @@ from rasterio.enums import Resampling
 from rasterio.warp import reproject, calculate_default_transform
 from rasterio.transform import from_bounds
 import scipy.sparse as sp
-from libpysal.weights import lat2W
+from libpysal.weights import W as libW
 from esda.moran import Moran
 from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
@@ -223,6 +223,13 @@ def compute_usi_pca(stacked_valid, names):
     stacked_valid : (n_valid, n_indicators) float64 array of normalised values
     names         : indicator names (same order as columns)
     Returns: 1-D USI_PCA array (n_valid,) normalised to [0, 1]
+
+    Sign anchoring:
+        PCA eigenvectors are sign-arbitrary.  We attempt to anchor to
+        Accessibility (unambiguously positive).  If Accessibility is absent
+        (e.g. no OSM data for a given city / scale), we fall back to the
+        first available positive-polarity indicator, then to the one with
+        the highest absolute PC1 loading.
     """
     scaler = StandardScaler()
     X_sc   = scaler.fit_transform(stacked_valid)
@@ -230,9 +237,26 @@ def compute_usi_pca(stacked_valid, names):
     pca.fit(X_sc)
     scores = pca.transform(X_sc)[:, 0]
 
-    # Anchor sign: flip if negatively correlated with Accessibility
-    acc_idx = names.index("Accessibility")
-    if np.corrcoef(scores, stacked_valid[:, acc_idx])[0, 1] < 0:
+    # ── Fallback sign-anchoring ───────────────────────────────────────────────
+    POSITIVE_ANCHORS = ["Accessibility", "NTL_VIIRS", "NDVI_S2"]
+    anchor_idx  = None
+    anchor_name = None
+    for candidate in POSITIVE_ANCHORS:
+        if candidate in names:
+            anchor_idx  = names.index(candidate)
+            anchor_name = candidate
+            break
+    if anchor_idx is None:
+        # Last resort: indicator with highest |PC1 loading| as a proxy anchor
+        anchor_idx  = int(np.argmax(np.abs(pca.components_[0])))
+        anchor_name = names[anchor_idx]
+        print(f"  ⚠ [compute_usi_pca] Anchor fallback: using '{anchor_name}' "
+              f"(no preferred positive-polarity indicator found in {names})")
+    elif anchor_name != "Accessibility":
+        print(f"  ⚠ [compute_usi_pca] Anchor fallback: 'Accessibility' missing, "
+              f"using '{anchor_name}'")
+
+    if np.corrcoef(scores, stacked_valid[:, anchor_idx])[0, 1] < 0:
         scores = -scores
 
     return minmax_1d(scores), pca.explained_variance_ratio_[0]
@@ -258,34 +282,55 @@ def normalise_indicator(arr2d, mask2d, name):
     return norm
 
 
-# ── Spatial weights and Moran helpers ─────────────────────────────────────────
-def build_sparse_weights(nrows, ncols):
-    """Queen-contiguity sparse weights for full grid (row-standardised)."""
-    w = lat2W(nrows, ncols, rook=False)
-    w.transform = "r"
-    n = nrows * ncols
-    rows_i, cols_i, vals = [], [], []
+# ── Spatial weights: valid cells only ─────────────────────────────────────────
+def build_weights_valid(mask):
+    """
+    Queen-contiguity weights restricted to valid (Bangkok) cells only.
+
+    Consistent with 04_spatial_analysis.py: no NaN imputation, no full-grid
+    lat2W. Building weights only for valid cells avoids artificially flattening
+    spatial variance and ensures MAUP Moran's I values are directly comparable
+    to those in spatial_analysis_report.txt.
+    """
+    rows_v, cols_v = np.where(mask)
+    n = len(rows_v)
+    nrows, ncols = mask.shape
+    cell_to_idx = {(int(r), int(c)): i
+                   for i, (r, c) in enumerate(zip(rows_v, cols_v))}
+    neighbors_dict = {}
+    weights_dict   = {}
+    for i, (r, c) in enumerate(zip(rows_v, cols_v)):
+        nbrs = []
+        for dr in (-1, 0, 1):
+            for dc in (-1, 0, 1):
+                if dr == 0 and dc == 0:
+                    continue
+                j = cell_to_idx.get((int(r) + dr, int(c) + dc))
+                if j is not None:
+                    nbrs.append(j)
+        neighbors_dict[i] = nbrs
+        weights_dict[i]   = [1.0 / len(nbrs)] * len(nbrs) if nbrs else []
+    w_obj = libW(neighbors_dict, weights_dict, silence_warnings=True)
+    r_list, c_list, v_list = [], [], []
     for i in range(n):
-        for j, wij in zip(w.neighbors[i], w.weights[i]):
-            rows_i.append(i); cols_i.append(j); vals.append(wij)
-    W_sp = sp.csr_matrix((vals, (rows_i, cols_i)), shape=(n, n))
-    return w, W_sp
+        for j, wij in zip(neighbors_dict[i], weights_dict[i]):
+            r_list.append(i); c_list.append(j); v_list.append(wij)
+    W_sp = sp.csr_matrix((v_list, (r_list, c_list)), shape=(n, n))
+    return w_obj, W_sp, rows_v, cols_v
 
 
-def global_morans_i(flat_vals, w):
-    fill = np.nanmean(flat_vals)
-    y    = np.where(np.isnan(flat_vals), fill, flat_vals)
-    return Moran(y, w, permutations=N_PERMS)
+def global_morans_i(valid_vals, w):
+    """Global Moran's I on valid-cell values only — no NaN imputation."""
+    return Moran(valid_vals, w, permutations=N_PERMS)
 
 
-def local_morans_i(flat_vals, W_sp, n_perms=N_PERMS):
-    rng  = np.random.default_rng(42)
-    fill = np.nanmean(flat_vals)
-    y    = np.where(np.isnan(flat_vals), fill, flat_vals)
-    n, std = len(y), y.std()
+def local_morans_i(valid_vals, W_sp, n_perms=N_PERMS):
+    """Local Moran's I on valid-cell values only — no NaN imputation."""
+    rng = np.random.default_rng(42)
+    n, std = len(valid_vals), valid_vals.std()
     if std < 1e-10:
         return np.zeros(n), np.ones(n)
-    z = (y - y.mean()) / std
+    z = (valid_vals - valid_vals.mean()) / std
     I_obs = z * W_sp.dot(z)
     count = np.zeros(n, dtype=np.int32)
     for _ in range(n_perms):
@@ -294,18 +339,17 @@ def local_morans_i(flat_vals, W_sp, n_perms=N_PERMS):
     return I_obs, (count + 1) / (n_perms + 1)
 
 
-def lisa_cluster_array(I_obs, p_sim, flat_vals, w_obj):
+def lisa_cluster_array(I_obs, p_sim, valid_vals, w_obj):
+    """LISA cluster labels for valid cells only."""
     import libpysal
-    fill  = np.nanmean(flat_vals)
-    y     = np.where(np.isnan(flat_vals), fill, flat_vals)
-    lag_y = libpysal.weights.lag_spatial(w_obj, y)
-    mv    = y.mean()
-    cl    = np.zeros(len(flat_vals), dtype=np.int8)
+    lag_y = libpysal.weights.lag_spatial(w_obj, valid_vals)
+    mv    = valid_vals.mean()
+    cl    = np.zeros(len(valid_vals), dtype=np.int8)
     sm    = p_sim <= SIG_LEVEL
-    cl[sm & (y > mv) & (lag_y > mv)] = 1
-    cl[sm & (y < mv) & (lag_y < mv)] = 2
-    cl[sm & (y > mv) & (lag_y < mv)] = 3
-    cl[sm & (y < mv) & (lag_y > mv)] = 4
+    cl[sm & (valid_vals > mv) & (lag_y > mv)] = 1
+    cl[sm & (valid_vals < mv) & (lag_y < mv)] = 2
+    cl[sm & (valid_vals > mv) & (lag_y < mv)] = 3
+    cl[sm & (valid_vals < mv) & (lag_y > mv)] = 4
     return cl
 
 
@@ -316,21 +360,23 @@ def analyse_scale(label, data2d, profile):
     print(f"\n  [{label}] grid {nrows}×{ncols} = {nrows*ncols:,} cells, "
           f"{n_valid:,} valid ({n_valid/(nrows*ncols)*100:.1f}%)")
 
-    flat = data2d.flatten()
-    print(f"  [{label}] Building queen weights …")
-    w, W_sp = build_sparse_weights(nrows, ncols)
-    mi = global_morans_i(flat, w)
+    valid_vals = data2d[valid_mask]   # 1-D, no NaN
+
+    print(f"  [{label}] Building queen weights (valid cells only, n={n_valid:,}) …")
+    w, W_sp, rows_v, cols_v = build_weights_valid(valid_mask)
+
+    mi = global_morans_i(valid_vals, w)
     print(f"  [{label}] Global Moran's I = {mi.I:.4f}  "
           f"(E[I]={mi.EI:.4f}, z={mi.z_sim:.3f}, p={mi.p_sim:.4f})")
 
     print(f"  [{label}] LISA ({N_PERMS} perms) …")
-    I_obs, p_sim = local_morans_i(flat, W_sp)
-    clusters     = lisa_cluster_array(I_obs, p_sim, flat, w)
-    inside       = ~np.isnan(flat)
+    I_obs, p_sim = local_morans_i(valid_vals, W_sp)
+    clusters     = lisa_cluster_array(I_obs, p_sim, valid_vals, w)
+    # clusters is length n_valid — no masking needed
 
     counts = {}
     for code, lbl in LISA_LABELS.items():
-        c = int(np.sum(clusters[inside] == code))
+        c = int(np.sum(clusters == code))
         counts[lbl] = (c, c / n_valid * 100)
         print(f"    {lbl:3s}: {c:5,} ({c/n_valid*100:.1f}%)")
 
@@ -454,6 +500,49 @@ def main():
     usi_1km, profile_1km = aggregate_to_res(usi_500, profile_500, 1000, OUT_1km)
     results["1km"] = analyse_scale("1km", usi_1km, profile_1km)
 
+    # ── PopDensity density sanity check ──────────────────────────────────────
+    # After resampling with Resampling.sum the raw pixel counts are divided by
+    # TARGET_CELL_AREA_KM2 = (target_res² / 1e6) to convert to persons/km².
+    # If the raw Residential.tif encodes persons per pixel (standard WorldPop
+    # format) this conversion is correct.  We validate here that the resulting
+    # density values sit within a plausible range for Bangkok.
+    #
+    # Expected plausible range:
+    #   •   0 – 1,000 p/km²   : peri-urban / agricultural fringe
+    #   • 1,000 – 30,000 p/km² : typical Bangkok urban range
+    #   •   > 30,000 p/km²    : hyper-dense inner wards (warn if >100,000)
+    #   •   > 500,000 p/km²   : almost certainly a unit error
+    DENSITY_WARN_HIGH = 200_000.0   # persons/km² — trigger a warning
+    DENSITY_HARD_CAP  = 500_000.0   # persons/km² — flag as likely error
+    if "PopDensity" in norm_250:
+        # Recover the un-normalised resampled density from the normalise step
+        # by re-running resample_raw_to_res at 250 m (no full recompute needed
+        # since we only need the stats, not the grid again).
+        try:
+            _pop_raw, _ = resample_raw_to_res(
+                RAW_INPUTS["PopDensity"], profile_500, 250,
+                RESAMPLE_METHOD["PopDensity"])
+            _pop_valid = _pop_raw[mask_250 & ~np.isnan(_pop_raw)]
+            _pop_max   = float(np.nanmax(_pop_valid)) if len(_pop_valid) > 0 else np.nan
+            _pop_med   = float(np.nanmedian(_pop_valid)) if len(_pop_valid) > 0 else np.nan
+            print(f"\n  [PopDensity 250 m] Validation:")
+            print(f"    Median  : {_pop_med:,.0f} persons/km²")
+            print(f"    Maximum : {_pop_max:,.0f} persons/km²")
+            if np.isnan(_pop_max):
+                print("    ⚠ Could not compute max — all values NaN after resampling.")
+            elif _pop_max > DENSITY_HARD_CAP:
+                print(f"    ✗ LIKELY ERROR: max density ({_pop_max:,.0f} p/km²) exceeds "
+                      f"{DENSITY_HARD_CAP:,.0f}. Check that Residential.tif stores "
+                      f"persons-per-pixel (not e.g. a population count scaled by area).")
+            elif _pop_max > DENSITY_WARN_HIGH:
+                print(f"    ⚠ WARNING: max density ({_pop_max:,.0f} p/km²) is unusually "
+                      f"high. Verify that raw pixel values are persons-per-pixel "
+                      f"and that the CRS uses metres.")
+            else:
+                print(f"    ✓ Density values appear plausible.")
+        except Exception as _e:
+            print(f"  ⚠ [PopDensity validation] Could not re-run resampling: {_e}")
+
     # ── Write report ─────────────────────────────────────────────────────────
     sep = "=" * 65
     sub = "-" * 65
@@ -486,7 +575,7 @@ def main():
     A("")
     A(f"Input   : USI_PCA from raw indicators (250 m) / canonical (500 m, 1 km)")
     A(f"Scales  : 250 m | 500 m | 1 km")
-    A(f"Method  : Queen contiguity, row-standardised weights (full grid)")
+    A(f"Method  : Queen contiguity, row-standardised weights (valid cells only)")
     A(f"Perms   : {N_PERMS}  |  Sig level: p < {SIG_LEVEL}")
     A("")
 
