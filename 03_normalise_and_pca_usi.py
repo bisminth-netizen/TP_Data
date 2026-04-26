@@ -253,12 +253,35 @@ def main():
     # Note: NDVI and inverted-LST often have NEGATIVE loadings on PC1 in
     # Bangkok because urban cores are accessible but also hot and less green.
     # This is a genuine spatial trade-off, not a sign error.
-    r_acc = np.corrcoef(pc1_scores, norm_valid["Accessibility"])[0, 1]
+    #
+    # Fallback: if Accessibility is missing (e.g. no OSM data for a city),
+    # anchor instead to the indicator with the highest absolute PC1 loading
+    # whose polarity is unambiguously +1.
+    POSITIVE_ANCHORS = ["Accessibility", "NTL", "NDVI"]  # ordered by preference
+    anchor_used = None
+    for anchor_candidate in POSITIVE_ANCHORS:
+        if anchor_candidate in norm_valid:
+            r_anchor = np.corrcoef(pc1_scores, norm_valid[anchor_candidate])[0, 1]
+            anchor_used = anchor_candidate
+            break
+    if anchor_used is None:
+        # Last resort: use the indicator with the highest absolute PC1 loading
+        abs_load = np.abs(pc1_loadings)
+        anchor_used = names[int(np.argmax(abs_load))]
+        r_anchor = np.corrcoef(pc1_scores, norm_valid[anchor_used])[0, 1]
+        print(f"  ⚠ PC1 sign anchor fallback: using '{anchor_used}' "
+              f"(highest |loading| = {abs_load.max():.4f})")
+    else:
+        if anchor_used != "Accessibility":
+            print(f"  ⚠ PC1 sign anchor fallback: 'Accessibility' missing, "
+                  f"using '{anchor_used}'")
+
+    r_acc = r_anchor   # kept for backward-compatible variable name below
     if r_acc < 0:
         pc1_scores = -pc1_scores
-        print("  PC1 sign FLIPPED (corr with Accessibility was %.3f < 0)" % r_acc)
+        print("  PC1 sign FLIPPED (corr with %s was %.3f < 0)" % (anchor_used, r_acc))
     else:
-        print("  PC1 sign kept  (corr with Accessibility = %.3f > 0)" % r_acc)
+        print("  PC1 sign kept  (corr with %s = %.3f > 0)" % (anchor_used, r_acc))
 
     # Report all indicator correlations for diagnostics
     all_inds = ["NTL", "NDVI", "LST", "PM25", "PopDensity", "Accessibility"]
